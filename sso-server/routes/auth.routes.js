@@ -53,8 +53,8 @@ router.post('/login', async (req, res) => {
     const accessToken = generateAccessToken(user._id);
     const refreshToken = generateRefreshToken(user._id);
 
-    // Save refresh token to database
-    user.refreshToken = refreshToken;
+    // Save refresh token to the activeSessions array
+    user.activeSessions.push({ refreshToken });
     await user.save();
 
     // Set access token in cookie
@@ -87,23 +87,47 @@ router.post('/login', async (req, res) => {
   }
 });
 
-// Logout user
+// Logout user (synchronized across all devices)
 router.post('/logout', async (req, res) => {
   try {
-    // Clear cookies
+    // Clear cookies for current client
     res.clearCookie('accessToken');
     res.clearCookie('refreshToken');
 
-    // If user is logged in, clear refresh token in database
+    // If user is logged in, clear ALL refresh tokens from the database (global logout)
     const refreshToken = req.cookies.refreshToken;
     if (refreshToken) {
       const decoded = verifyToken(refreshToken);
       if (decoded) {
-        await User.findByIdAndUpdate(decoded.id, { refreshToken: null });
+        // Get user ID
+        const userId = decoded.id;
+        
+        // Remove all active sessions for this user
+        await User.findByIdAndUpdate(userId, { activeSessions: [] });
+        
+        // Emit logout event to all connected clients of this user
+        const io = req.app.get('io');
+        const userSockets = req.app.get('userSockets');
+        
+        if (io && userSockets && userSockets.has(userId)) {
+          const socketIds = userSockets.get(userId);
+          
+          // Emit 'force-logout' event to all of user's connected sockets
+          socketIds.forEach(socketId => {
+            io.to(socketId).emit('force-logout', { 
+              message: 'You have been logged out from another device'
+            });
+          });
+          
+          console.log(`Emitted force-logout to ${socketIds.size} connected clients for user ${userId}`);
+          
+          // Clear socket mappings for this user
+          userSockets.delete(userId);
+        }
       }
     }
 
-    res.json({ message: 'Logout successful' });
+    res.json({ message: 'Logout successful from all devices' });
   } catch (error) {
     console.error('Logout error:', error);
     res.status(500).json({ message: 'Server error' });
@@ -124,9 +148,27 @@ router.get('/validate', async (req, res) => {
       return res.status(401).json({ valid: false });
     }
 
-    const user = await User.findById(decoded.id).select('-password -refreshToken');
+    const user = await User.findById(decoded.id).select('-password');
     if (!user) {
       return res.status(401).json({ valid: false });
+    }
+
+    // Check if refresh token exists in user's active sessions
+    const refreshToken = req.cookies.refreshToken;
+    if (refreshToken) {
+      const hasValidSession = user.activeSessions.some(
+        session => session.refreshToken === refreshToken
+      );
+      
+      if (!hasValidSession) {
+        // This session was invalidated by another client's logout
+        res.clearCookie('accessToken');
+        res.clearCookie('refreshToken');
+        return res.status(401).json({ 
+          valid: false,
+          message: 'Session invalidated by logout from another device'
+        });
+      }
     }
 
     res.json({
@@ -158,22 +200,33 @@ router.post('/refresh', async (req, res) => {
       return res.status(401).json({ message: 'Invalid refresh token' });
     }
 
-    // Find user with matching refresh token
-    const user = await User.findOne({
-      _id: decoded.id,
-      refreshToken: refreshToken
-    });
-
+    // Find user with matching refresh token in active sessions
+    const user = await User.findById(decoded.id);
+    
     if (!user) {
       return res.status(401).json({ message: 'Invalid refresh token' });
+    }
+    
+    // Check if the refresh token exists in the user's active sessions
+    const sessionIndex = user.activeSessions.findIndex(
+      session => session.refreshToken === refreshToken
+    );
+    
+    if (sessionIndex === -1) {
+      // This means the token was invalidated by logout from another device
+      res.clearCookie('accessToken');
+      res.clearCookie('refreshToken');
+      return res.status(401).json({ 
+        message: 'Session invalidated by logout from another device'
+      });
     }
 
     // Generate new tokens
     const newAccessToken = generateAccessToken(user._id);
     const newRefreshToken = generateRefreshToken(user._id);
 
-    // Update refresh token in database
-    user.refreshToken = newRefreshToken;
+    // Update refresh token in active sessions
+    user.activeSessions[sessionIndex].refreshToken = newRefreshToken;
     await user.save();
 
     // Set new tokens in cookies
