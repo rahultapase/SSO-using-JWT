@@ -4,11 +4,12 @@ import { useAuth } from '../context/AuthContext';
 
 const Header = () => {
   const { isAuthenticated, logout } = useAuth();
-
-  const handleLogout = async () => {
+  
+  const handleLogout = async (e) => {
+    e.preventDefault();
     await logout();
   };
-
+  
   return (
     <header className="header">
       <h1>Client 2</h1>
@@ -17,7 +18,7 @@ const Header = () => {
         {isAuthenticated ? (
           <>
             <Link to="/dashboard">Dashboard</Link>
-            <a href="#" onClick={handleLogout}>Logout</a>
+            <Link to="/" onClick={handleLogout}>Logout</Link>
           </>
         ) : (
           <>
@@ -30,4 +31,4 @@ const Header = () => {
   );
 };
 
-export default Header; 
+export default Header;
